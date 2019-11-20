@@ -17,6 +17,7 @@ import Text.Pretty.Simple
 import Data.Word
 import Data.Bits
 import Data.Int
+import Data.List (find)
 
 import Numeric
 import Data.Char
@@ -28,7 +29,7 @@ someFunc = do
   print "iniciando"
   [ arg ] <- getArgs
   image <-  someFunc2 arg
-  print $ length $ imageRawObjects $ image
+  pPrint $ length $ imageRawObjects $ image
   -- parseTest imageParser file
 -- someFunc2 :: IO ()
 someFunc2 arg = do
@@ -54,6 +55,13 @@ data Image = Image
   , imageRawObjects :: [(Int64, RawObject)]
   } deriving (Show)
 
+data RawObjectHeader = RawObjectHeader
+  { rawObjectHeaderNumSlots :: Word64
+  , rawObjectHeaderFormat :: Word64
+  , rawObjectHeaderHash :: Word64
+  , rawObjectHeaderClassIndex :: Word64
+  } deriving (Show)
+
 data ImageHeader = ImageHeader
   { imageHeaderSize :: Word32
   , objectMemorySize :: Word64
@@ -65,10 +73,7 @@ data ImageHeader = ImageHeader
   } deriving (Show)
 
 data RawObject = RawObject
-  { rawObjectNumSlots :: Word64
-  , rawObjectClassIndex :: Word64
-  , rawObjectFormat :: Word64
-  , rawObjectHash :: Word64
+  { rawObjectHeader :: RawObjectHeader
   , rawObjectSlots :: [Word64]
   } deriving (Show)
 
@@ -76,58 +81,64 @@ data RawObject = RawObject
 sliceFromBits offset size bits =
   shiftR bits offset .&. (shift 1 size - 1)
 
+rawObjectHeaderParser = do
+  (rawHeader, header) <- rawObjectHeaderParser'
+
+  if rawObjectHeaderNumSlots header == 255
+    then do
+      (_, nextHeader) <- rawObjectHeaderParser'
+      when (rawObjectHeaderNumSlots nextHeader /= 255)
+        $ fail "el header no era 255"
+      let realNumSlots = rawHeader .&. 0xffffffffffff
+      pure $ nextHeader { rawObjectHeaderNumSlots = realNumSlots }
+
+    else do
+      pure header
+
+
+rawObjectHeaderParser' = do
+  header <- getWord64le
+  let
+    numSlots = sliceFromBits 56 8 header
+    format = sliceFromBits 24 5  header
+    hash = sliceFromBits 64 22 header
+    classIndex = sliceFromBits 0 22 header
+  pure (header, RawObjectHeader numSlots format hash classIndex)
+
 rawObjectParser = do
   -- pos <- fromIntegral @_ @Word64 <$> bytesRead
   pos <- bytesRead
-  header <- getWord64le
+  header <- rawObjectHeaderParser
+  slots <- replicateM (fromIntegral $ max (rawObjectHeaderNumSlots header) 1)  getWord64le
+  return $ (pos, RawObject header slots)
+
+-- findOopInsideImage :: Word64 -> Image -> Maybe (Int64, RawObject)
+findOopInsideImage offset image =
   let
-      numSlots' = sliceFromBits 56 8 header
-      format = sliceFromBits 24 5  header
-      hash = sliceFromBits 64 22 header
-      classIndex = sliceFromBits 0 22 header
-  if numSlots' == 255
-    then do
-      header' <- getWord64le
-      let
-        numSlots' = sliceFromBits 56 8 header'
-        realNumSlots = header .&. 0xffffffffffff
-        format = sliceFromBits 24 5  header'
-        hash = sliceFromBits 64 22 header'
-        classIndex = sliceFromBits 0 22 header'
-      when (numSlots' /= 255)
-        $ fail "255 no estaba ahi"
-      slots <- replicateM (fromIntegral realNumSlots)  getWord64le
-
-      return $ (pos, RawObject realNumSlots classIndex format hash slots)
-
-    else do
-      slots <- replicateM (fromIntegral $ max numSlots' 1)  getWord64le
-
-      return $ (pos, RawObject numSlots' classIndex format hash slots)
-
+    realOffset =
+      offset
+      - (fromIntegral $ oldBaseAddr $ imageHeader image)
+      + (fromIntegral $ imageHeaderSize $ imageHeader image)
+  in find (\(o, object) -> fromIntegral o == realOffset) $ imageRawObjects image
 
 
 -- imageParser :: Parser Image
 imageParser = do
   version <- getWord32le
   imageHeader <- imageHeaderParser
-  -- object <- many' rawObjectParser
   objects <- many rawObjectParser
-  -- object <- return []
 
   return $ Image version imageHeader objects
-  -- return $ Image version imageHeader objects
-  -- return $ (version, imageHeader, objects)
 
 -- imageHeaderParser :: Parser ImageHeader
 imageHeaderParser = do
-  imageHeaderSize <- getWord32le -- readWord();
-  objectMemorySize <- getWord64le -- readWord(); //first unused location in heap
-  oldBaseAddr <- getWord64le -- readWord(); //object memory base address of image
-  specialObjectsOopInt <- getWord64le -- readWord(); //oop of array of special oops
-  lastHash <- getWord64le -- readWord(); //Should be loaded from, and saved to the image header
-  savedHeaderWords <- sequence . replicate 5 $  getWord64le -- [];
-  firstSegSize <- getWord64le -- readWord();
+  imageHeaderSize <- getWord32le
+  objectMemorySize <- getWord64le -- first unused location in heap
+  oldBaseAddr <- getWord64le -- object memory base address of image
+  specialObjectsOopInt <- getWord64le -- oop of array of special oops
+  lastHash <- getWord64le -- Should be loaded from, and saved to the image header
+  savedHeaderWords <- replicateM 5 getWord64le
+  firstSegSize <- getWord64le
 
   goto $ fromIntegral @_ @Int64 imageHeaderSize
 
